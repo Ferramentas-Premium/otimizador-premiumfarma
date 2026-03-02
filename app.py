@@ -1,4 +1,20 @@
 import streamlit as st
+
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.text_input("Introduza a palavra-passe", type="password", key="password")
+        if st.button("Entrar"):
+            # Em vez de escrever a pass aqui, chamamos o segredo 'my_password'
+            if st.session_state["password"] == st.secrets["my_password"]:
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Palavra-passe incorreta")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
 import pandas as pd
 import altair as alt
 import io
