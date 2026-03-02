@@ -1,6 +1,4 @@
+streamlit>=1.31.0
 pandas
-streamlit
 openpyxl
-xlrd
-Pillow
-altair
+altair<5
