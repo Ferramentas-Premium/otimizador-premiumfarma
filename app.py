@@ -1,10 +1,14 @@
 import streamlit as st
 
 def check_password():
+    # Auto-login via token no URL (vindo da landing page Premium Farma)
+    params = st.query_params
+    if params.get("token") == st.secrets["my_password"]:
+        st.session_state["password_correct"] = True
+
     if "password_correct" not in st.session_state:
         st.text_input("Introduza a palavra-passe", type="password", key="password")
         if st.button("Entrar"):
-            # Em vez de escrever a pass aqui, chamamos o segredo 'my_password'
             if st.session_state["password"] == st.secrets["my_password"]:
                 st.session_state["password_correct"] = True
                 st.rerun()
@@ -106,12 +110,10 @@ def process_files(cardex_file, vendas_file, db_file, pvp_margin):
         cardex['CNPEM_MATCH'] = cardex['CNPEM'].apply(clean_code)
         cardex['CNP_STR'] = cardex['CNP'].apply(clean_code)
         
-        # Mapeamento de nomes de colunas do Cardex Total
         c_pvp_col = 'PVP (R)' if 'PVP (R)' in cardex.columns else 'PVP'
         c_rent_col = 'Rentb. Máxima' if 'Rentb. Máxima' in cardex.columns else 'Rentabilidade'
         c_name_col = 'Descrição' if 'Descrição' in cardex.columns else 'Nome do produto'
 
-        # Determinar Tipologia se as colunas existirem
         if 'Margem' in cardex.columns and 'Margem.1' in cardex.columns and 'Margem.4' in cardex.columns:
             def identify_typology(row):
                 if row['Margem'] == row[c_rent_col]: return "AT"
@@ -122,7 +124,6 @@ def process_files(cardex_file, vendas_file, db_file, pvp_margin):
         else:
             cardex['Tipologia'] = "N/A"
 
-        # Filtrar comercialização
         if status_map is not None:
             cardex['Status_Comerc'] = cardex['CNP_STR'].map(status_map)
             cardex = cardex[~cardex['Status_Comerc'].str.contains('Não comercializado|Esgotado', case=False, na=False)]
@@ -145,7 +146,6 @@ def process_files(cardex_file, vendas_file, db_file, pvp_margin):
         idx = merged.groupby(merged.index)['Rentabilidade_Cardex'].idxmax()
         results = merged.loc[idx].copy()
 
-        # 6. Preços Utente
         if prices_lookup is not None:
             results = results.join(prices_lookup, on='CNP_MATCH', rsuffix='_Atual')
             results['CNP_Cardex_STR'] = results['CNP_Cardex'].apply(clean_code)
