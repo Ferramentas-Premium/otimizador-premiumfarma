@@ -66,11 +66,30 @@ def load_data(file):
                 break
             except UnicodeDecodeError:
                 continue
-        return pd.read_csv(io.StringIO(text), sep=';', dtype=str, on_bad_lines='skip', low_memory=False)
+        return read_csv_tolerante(text)
     elif name.endswith('.xls'):
         return pd.read_excel(file, engine='xlrd')
     else:
         return pd.read_excel(file)
+
+def read_csv_tolerante(text):
+    """Lê o CSV (;) sem perder linhas: quando um campo de texto traz ';' lá dentro
+    (acontece no GRUPOHOMOGENEO do Winphar), junta os pedaços em vez de descartar a linha."""
+    import csv
+    rows = list(csv.reader(io.StringIO(text), delimiter=';'))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    header = [h.strip() for h in rows[0]]
+    n = len(header)
+    idx_txt = header.index('GRUPOHOMOGENEO') if 'GRUPOHOMOGENEO' in header else n - 1
+    fixed = []
+    for r in rows[1:]:
+        if len(r) > n:
+            extra = len(r) - n
+            r = r[:idx_txt] + [';'.join(r[idx_txt:idx_txt + extra + 1])] + r[idx_txt + extra + 1:]
+        elif len(r) < n:
+            r = r + [''] * (n - len(r))
+        fixed.append(r)
+    return pd.DataFrame(fixed, columns=header).replace({'': None})
 
 def to_num(series):
     """Converte para número aceitando '8,61', '8.61' e '1.234,56'."""
@@ -86,7 +105,7 @@ def detect_origem(vendas):
     if 'V01' in cols and 'V13' in cols:
         return 'Softreis'
     if 'V0' in cols and all(f'V{i}' in cols for i in range(1, 13)):
-        return 'Sifarma'
+        return 'Winphar' if 'CodANF' in cols else 'Sifarma'
     return 'Outro'
 
 def normalize_vendas(vendas):
@@ -96,9 +115,9 @@ def normalize_vendas(vendas):
     origem = detect_origem(vendas)
 
     # Vendas dos últimos 12 meses completos (sem o mês corrente)
-    #  - Sifarma:  V0 = mês corrente, V1..V12 = 12 meses anteriores
+    #  - Sifarma e Winphar: V0 = mês corrente, V1..V12 = 12 meses anteriores
     #  - Softreis: V01 = mês corrente, V02..V13 = 12 meses anteriores
-    if origem == 'Sifarma':
+    if origem in ('Sifarma', 'Winphar'):
         v_cols = [f'V{i}' for i in range(1, 13)]
     elif origem == 'Softreis':
         v_cols = [f'V{i:02d}' for i in range(2, 14)]
@@ -227,9 +246,9 @@ def process_files(cardex_file, vendas_file, db_file, pvp_margin):
 
         if merged.empty: return diag
 
-        # Uma única sugestão (a mais rentável) por produto vendido
-        idx = merged.groupby('_ROW')['Rentabilidade_Cardex'].idxmax()
-        results = merged.loc[idx].copy()
+        # Todas as alternativas com rentabilidade superior ficam na tabela;
+        # a interface ordena-as e só soma a mais rentável de cada produto.
+        results = merged.drop_duplicates(['_ROW', 'CNP_Cardex']).copy()
 
         if prices_lookup is not None:
             results = results.join(prices_lookup, on='CNP_MATCH', rsuffix='_Atual')
@@ -246,6 +265,59 @@ def process_files(cardex_file, vendas_file, db_file, pvp_margin):
         return results
     except Exception as e:
         return f"Erro técnico: {e}"
+
+def export_excel(df, resumo):
+    """Gera o relatório em Excel: folha 'Trocas' formatada e folha 'Resumo'."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as xw:
+        df = df.copy()
+        for c in ['CNP Atual', 'CNP Sugerido']:
+            if c in df.columns:
+                num = pd.to_numeric(df[c], errors='coerce')
+                df[c] = num.astype('Int64').where(num.notna(), df[c]) if num.notna().all() else df[c]
+        df.to_excel(xw, sheet_name='Trocas', index=False)
+        pd.DataFrame(list(resumo.items()), columns=['Indicador', 'Valor']).to_excel(xw, sheet_name='Resumo', index=False)
+
+        verde = PatternFill('solid', fgColor='0F6E56')
+        verde_claro = PatternFill('solid', fgColor='E3F4EE')
+        euro = '#,##0.00 €'
+        euro_cols = {'PVP Atual', 'Utente Atual', 'Pens. Atual', 'PVP Sugerido', 'Utente Novo', 'Pens. Novo',
+                     'Rent. Atual', 'Rent. Nova', 'Ganho Est.'}
+        larguras = {'Produto Atual': 45, 'Substituir por': 45, 'Lab. Sugerido': 18}
+
+        for ws in xw.book.worksheets:
+            for c in ws[1]:
+                c.font = Font(bold=True, color='FFFFFF')
+                c.fill = verde
+                c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            ws.freeze_panes = 'A2'
+
+        ws = xw.book['Trocas']
+        ws.auto_filter.ref = ws.dimensions
+        ws.row_dimensions[1].height = 30
+        headers = [c.value for c in ws[1]]
+        col_opcao = headers.index('Opção') + 1 if 'Opção' in headers else None
+        for j, h in enumerate(headers, start=1):
+            ws.column_dimensions[get_column_letter(j)].width = larguras.get(h, 13)
+            if h in euro_cols:
+                for (cell,) in ws.iter_rows(min_row=2, min_col=j, max_col=j):
+                    cell.number_format = euro
+            elif h == 'Vendas':
+                for (cell,) in ws.iter_rows(min_row=2, min_col=j, max_col=j):
+                    cell.number_format = '0'
+        # Destacar a alternativa mais rentável (opção 1) de cada produto
+        if col_opcao:
+            for row in ws.iter_rows(min_row=2):
+                if str(row[col_opcao - 1].value).startswith('1/'):
+                    for cell in row:
+                        cell.fill = verde_claro
+
+        ws = xw.book['Resumo']
+        ws.column_dimensions['A'].width = 48
+        ws.column_dimensions['B'].width = 22
+    return buf.getvalue()
 
 # --- INTERFACE ---
 with st.expander("📁 Gestão de Ficheiros", expanded=True):
@@ -279,6 +351,8 @@ if cardex_upload and vendas_upload and db_upload:
         all_c_labs = sorted(results_raw['Lab_Cardex'].dropna().unique())
         selected_c_lab = f2.selectbox("Substituir pelo Lab (Cardex):", options=["Todos"] + all_c_labs)
 
+        so_melhor = st.toggle("Mostrar só a alternativa mais rentável de cada produto", value=False)
+
         filtered = results_raw.copy()
         if escolha_gen != "Ambos":
             filtered = filtered[filtered['GEN'] == {"Genérico": "S", "Marca": "N"}[escolha_gen]]
@@ -286,26 +360,45 @@ if cardex_upload and vendas_upload and db_upload:
         if selected_c_lab != "Todos": filtered = filtered[filtered['Lab_Cardex'] == selected_c_lab]
         
         if not filtered.empty:
+            # Ordenar as alternativas de cada produto (1 = mais rentável),
+            # já depois dos filtros: se escolher um laboratório, a opção 1 é a melhor desse laboratório
+            filtered = filtered.sort_values(['_ROW', 'Rentabilidade_Cardex'], ascending=[True, False])
+            filtered['Opcao'] = filtered.groupby('_ROW').cumcount() + 1
+            filtered['N_Alternativas'] = filtered.groupby('_ROW')['_ROW'].transform('size')
+            melhores = filtered[filtered['Opcao'] == 1]
+            filtered['Ganho_Produto'] = filtered['_ROW'].map(melhores.set_index('_ROW')['Ganho_Potencial'])
+            filtered = filtered.sort_values(['Ganho_Produto', '_ROW', 'Opcao'], ascending=[False, True, True])
+            if so_melhor:
+                filtered = filtered[filtered['Opcao'] == 1]
+
             st.divider()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("GANHO ESTIMADO", f"{filtered['Ganho_Potencial'].sum():,.2f} €")
-            c2.metric("UNIDADES (12M)", f"{int(filtered['V13_TOTAL'].sum())} un")
-            c3.metric("SUBSTITUIÇÕES", len(filtered))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("GANHO ESTIMADO", f"{melhores['Ganho_Potencial'].sum():,.2f} €",
+                      help="Soma apenas a alternativa mais rentável de cada produto")
+            c2.metric("UNIDADES (12M)", f"{int(melhores['V13_TOTAL'].sum())} un")
+            c3.metric("PRODUTOS A TROCAR", len(melhores))
+            c4.metric("ALTERNATIVAS", int(melhores['N_Alternativas'].sum()))
             
             st.divider()
             st.subheader("📋 Detalhe Comparativo")
             
+            filtered['Opcao_Txt'] = filtered['Opcao'].astype(str) + '/' + filtered['N_Alternativas'].astype(str)
             cols_to_show = [
-                'CNP_MATCH', 'NOM', 'PVP_Vendas', 'Preço Utente', 'Preço Pensionistas',
-                'CNP_Cardex', 'Nome_Cardex', 'PVP_Cardex', 'Preço Utente_Sugerido', 'Preço Pensionistas_Sugerido',
+                'CNP_MATCH', 'NOM', 'PVP_Vendas', 'Preço Utente', 'Preço Pensionistas', 'Opcao_Txt',
+                'CNP_Cardex', 'Nome_Cardex', 'Lab_Cardex', 'PVP_Cardex', 'Preço Utente_Sugerido', 'Preço Pensionistas_Sugerido',
                 'Rentabilidade_Vendas', 'Rentabilidade_Cardex', 'V13_TOTAL', 'Ganho_Potencial', 'Tipologia'
             ]
-            display_df = filtered[cols_to_show].copy()
-            display_df.columns = [
-                'CNP Atual', 'Produto Atual', 'PVP Atual', 'Utente Atual', 'Pens. Atual',
-                'CNP Sugerido', 'Substituir por', 'PVP Sugerido', 'Utente Novo', 'Pens. Novo',
-                'Rent. Atual', 'Rent. Nova', 'Vendas', 'Ganho Est.', 'Tipologia'
-            ]
+            display_df = filtered[[c for c in cols_to_show if c in filtered.columns]].copy()
+            display_df = display_df.rename(columns={
+                'CNP_MATCH': 'CNP Atual', 'NOM': 'Produto Atual', 'PVP_Vendas': 'PVP Atual',
+                'Preço Utente': 'Utente Atual', 'Preço Pensionistas': 'Pens. Atual', 'Opcao_Txt': 'Opção',
+                'CNP_Cardex': 'CNP Sugerido', 'Nome_Cardex': 'Substituir por', 'Lab_Cardex': 'Lab. Sugerido',
+                'PVP_Cardex': 'PVP Sugerido', 'Preço Utente_Sugerido': 'Utente Novo', 'Preço Pensionistas_Sugerido': 'Pens. Novo',
+                'Rentabilidade_Vendas': 'Rent. Atual', 'Rentabilidade_Cardex': 'Rent. Nova', 'V13_TOTAL': 'Vendas',
+                'Ganho_Potencial': 'Ganho Est.'
+            })
+            st.caption("Cada produto mostra todas as alternativas mais rentáveis, da melhor (1) para a pior. "
+                       "O Ganho Est. de cada linha é o ganho se a farmácia escolher essa alternativa.")
             
             for col in ['CNP Atual', 'CNP Sugerido']: display_df[col] = display_df[col].astype(str).str.split('.').str[0]
 
@@ -317,7 +410,20 @@ if cardex_upload and vendas_upload and db_upload:
                 'Vendas': '{:.0f}', 'Ganho Est.': '{:.2f} €'
             }), use_container_width=True, height=600, hide_index=True)
             
-            st.download_button("📥 Exportar Relatório", display_df.to_csv(index=False).encode('utf-8'), "premiumfarma_tipologia.csv", "text/csv")
+            resumo = {
+                'Ficheiro de vendas': results_raw.attrs.get('diag', {}).get('origem', ''),
+                'Substituir a partir de': escolha_gen,
+                'Trocar do Lab (Vendas)': selected_v_lab,
+                'Substituir pelo Lab (Cardex)': selected_c_lab,
+                'Margem PVP (€)': pvp_margin,
+                'Ganho estimado 12M (€) – só a melhor alternativa': round(float(melhores['Ganho_Potencial'].sum()), 2),
+                'Unidades 12M': int(melhores['V13_TOTAL'].sum()),
+                'Produtos a trocar': len(melhores),
+                'Alternativas': int(melhores['N_Alternativas'].sum()),
+            }
+            st.download_button("📥 Exportar Relatório (Excel)", export_excel(display_df, resumo),
+                               "premiumfarma_trocas.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
             st.warning("Sem resultados para os filtros selecionados.")
     else:
